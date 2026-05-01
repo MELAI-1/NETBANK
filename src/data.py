@@ -2,6 +2,8 @@ import polars as pl
 import pandas as pd
 import numpy as np
 import datetime
+import zipfile
+import os
 from sklearn.preprocessing import LabelEncoder
 import gc
 import logging
@@ -10,84 +12,67 @@ from typing import Tuple
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def unzip_data(data_dir: str):
+    """Auto-unzip files for Colab environments."""
+    for item in os.listdir(data_dir):
+        if item.endswith(".zip"):
+            file_name = os.path.join(data_dir, item)
+            output_dir = os.path.join(data_dir, item.replace(".zip", ""))
+            if not os.path.exists(output_dir):
+                logger.info(f"📦 Unzipping {item}...")
+                with zipfile.ZipFile(file_name, 'r') as zip_ref:
+                    zip_ref.extractall(output_dir)
+
 def create_advanced_features(data_dir: str) -> pl.DataFrame:
-    """Creates high-signal behavioral features using Polars."""
-    logger.info("🛠️ Extracting advanced behavioral features...")
+    """Creates behavioral features optimized for memory."""
+    unzip_data(data_dir)
     
-    txn_path = f"{data_dir}/transactions_features/transactions_features.parquet"
-    txn = pl.scan_parquet(txn_path)
+    # Path handling (search for parquet in unzipped folders)
+    def find_parquet(folder_name):
+        base_path = os.path.join(data_dir, folder_name)
+        for root, dirs, files in os.walk(base_path):
+            for file in files:
+                if file.endswith(".parquet"):
+                    return os.path.join(root, file)
+        return None
+
+    txn_path = find_parquet("transactions_features")
+    if not txn_path: raise FileNotFoundError("Transaction parquet not found!")
+    
+    txn = pl.scan_parquet(txn_path).select(['UniqueID', 'TransactionDate', 'TransactionAmount', 'AccountID'])
     txn = txn.with_columns(pl.col("TransactionDate").cast(pl.Date))
     
     ref_date = datetime.date(2015, 10, 31)
     
-    # 1. RFM & Basic Aggs
-    rfm = txn.group_by("UniqueID").agg([
+    # 1. RFM Aggregations
+    behavior = txn.group_by("UniqueID").agg([
         pl.len().alias("frequency"),
         pl.col("TransactionAmount").sum().alias("monetary"),
         pl.col("TransactionAmount").mean().alias("avg_spend"),
-        pl.col("TransactionAmount").std().alias("std_spend"),
         ((pl.lit(ref_date) - pl.col("TransactionDate").max()).dt.total_days()).alias("recency"),
-        pl.col("AccountID").n_unique().alias("account_diversity"),
-        # Weekend behavior
-        pl.col("TransactionDate").dt.weekday().is_in([6, 7]).sum().alias("weekend_txn_count")
-    ])
+        pl.col("AccountID").n_unique().alias("account_diversity")
+    ]).collect()
     
-    # 2. Diversity Score (Account concentration)
-    rfm = rfm.with_columns([
-        (pl.col("frequency") / pl.col("account_diversity")).alias("txn_per_account"),
-        (pl.col("weekend_txn_count") / pl.col("frequency")).alias("weekend_ratio")
-    ])
-    
-    # 3. Monthly Trends (Last 3 months)
-    m1 = txn.filter(pl.col("TransactionDate") >= datetime.date(2015, 10, 1)).group_by("UniqueID").agg(pl.len().alias("m1_count"))
-    m2 = txn.filter((pl.col("TransactionDate") >= datetime.date(2015, 9, 1)) & (pl.col("TransactionDate") < datetime.date(2015, 10, 1))).group_by("UniqueID").agg(pl.len().alias("m2_count"))
-    m3 = txn.filter((pl.col("TransactionDate") >= datetime.date(2015, 8, 1)) & (pl.col("TransactionDate") < datetime.date(2015, 9, 1))).group_by("UniqueID").agg(pl.len().alias("m3_count"))
-    
-    trends = rfm.join(m1, on="UniqueID", how="left").join(m2, on="UniqueID", how="left").join(m3, on="UniqueID", how="left").fill_null(0)
-    
-    # 4. Momentum (Is activity increasing or decreasing?)
-    trends = trends.with_columns([
-        (pl.col("m1_count") / (pl.col("m2_count") + 1)).alias("momentum_1m"),
-        (pl.col("m1_count") / ((pl.col("m1_count") + pl.col("m2_count") + pl.col("m3_count")) / 3 + 1)).alias("velocity_3m")
-    ])
-    
-    return trends.collect()
+    return behavior
 
 def load_and_preprocess(data_dir: str, seed: int = 42) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
-    """Robust pipeline with best practices for Zindi/Kaggle."""
+    """Pipeline ready for Colab/Kaggle."""
+    unzip_data(data_dir)
     
-    train = pl.read_csv(f"{data_dir}/Train.csv")
-    test = pl.read_csv(f"{data_dir}/Test.csv")
-    demo = pl.read_parquet(f"{data_dir}/demographics_clean/demographics_clean.parquet")
-    fin = pl.read_parquet(f"{data_dir}/financials_features/financials_features.parquet").group_by("UniqueID").agg([
-        pl.col("NetInterestIncome").sum().alias("fin_income"),
-        pl.col("NetInterestRevenue").sum().alias("fin_revenue")
-    ])
+    train = pl.read_csv(os.path.join(data_dir, "Train.csv"))
+    test = pl.read_csv(os.path.join(data_dir, "Test.csv"))
     
-    # Advanced features
+    # Behavioral Features
     behavior = create_advanced_features(data_dir)
     
-    logger.info("Merging and cleaning...")
-    def pipeline(df):
-        return (df.join(demo, on="UniqueID", how="left")
-                .join(behavior, on="UniqueID", how="left")
-                .join(fin, on="UniqueID", how="left")
-                .fill_null(0))
-
-    train_pd = pipeline(train).to_pandas()
-    test_pd = pipeline(test).to_pandas()
+    logger.info("Merging datasets...")
+    train_pd = train.join(behavior, on="UniqueID", how="left").fill_null(0).to_pandas()
+    test_pd = test.join(behavior, on="UniqueID", how="left").fill_null(0).to_pandas()
     
-    # Target transformation
+    # Target
     y = np.log1p(train_pd["next_3m_txn_count"])
     
-    # Date handling
-    for df in [train_pd, test_pd]:
-        if "BirthDate" in df.columns:
-            df["BirthDate"] = pd.to_datetime(df["BirthDate"], errors="coerce")
-            df["Age"] = (pd.to_datetime("2015-10-31") - df["BirthDate"]).dt.days // 365
-            df["Age"] = df["Age"].fillna(df["Age"].median())
-            
-    # Categorical Encoding
+    # Simple Categorical Encoding
     cat_cols = train_pd.select_dtypes(include=['object']).columns.tolist()
     for col in ["UniqueID", "BirthDate", "RunDate"]:
         if col in cat_cols: cat_cols.remove(col)

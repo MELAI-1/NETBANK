@@ -3,70 +3,79 @@ import pandas as pd
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostRegressor
+from pytorch_tabnet.tab_model import TabNetRegressor
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import mean_squared_error
 from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+import torch
 import logging
 
 logger = logging.getLogger(__name__)
 
 def train_and_predict(X, y, X_test, seed=42):
-    """Triple Stacking (LGBM, XGB, CatBoost) with Stratified K-Fold."""
+    """Quad Stacking (LGBM, XGB, CatBoost, TabNet) with Stratified K-Fold."""
     
-    # Stratified K-Fold on Binned Target (for regression stability)
     n_splits = 5
     y_bins = pd.cut(y, bins=10, labels=False)
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     
-    oof_lgb = np.zeros(len(X))
-    oof_xgb = np.zeros(len(X))
-    oof_cat = np.zeros(len(X))
-    
-    test_lgb = np.zeros(len(X_test))
-    test_xgb = np.zeros(len(X_test))
-    test_cat = np.zeros(len(X_test))
+    # Storage for OOF and Test predictions
+    models = ['lgb', 'xgb', 'cat', 'tabnet']
+    oof_preds = {m: np.zeros(len(X)) for m in models}
+    test_preds = {m: np.zeros(len(X_test)) for m in models}
 
-    lgb_params = {'n_estimators': 3000, 'learning_rate': 0.015, 'num_leaves': 127, 'max_depth': -1, 'random_state': seed, 'verbose': -1}
-    xgb_params = {'n_estimators': 3000, 'learning_rate': 0.015, 'max_depth': 8, 'subsample': 0.8, 'random_state': seed}
-    cat_params = {'iterations': 3000, 'learning_rate': 0.015, 'depth': 8, 'random_seed': seed, 'verbose': 0}
+    # Scaling for TabNet
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    X_test_scaled = scaler.transform(X_test)
 
     for fold, (t_idx, v_idx) in enumerate(skf.split(X, y_bins)):
         logger.info(f"🚀 Training Fold {fold+1}/{n_splits}...")
+        
+        # GBDT Split
         xt, yt = X.iloc[t_idx], y.iloc[t_idx]
         xv, yv = X.iloc[v_idx], y.iloc[v_idx]
+        
+        # TabNet Split (scaled)
+        xt_s, xv_s = X_scaled[t_idx], X_scaled[v_idx]
 
-        # 1. LightGBM (Tweedie objective for counts)
-        m_lgb = lgb.LGBMRegressor(**lgb_params, objective='tweedie')
-        m_lgb.fit(xt, yt, eval_set=[(xv, yv)], callbacks=[lgb.early_stopping(150), lgb.log_evaluation(0)])
-        oof_lgb[v_idx] = m_lgb.predict(xv)
-        test_lgb += m_lgb.predict(X_test) / n_splits
+        # 1. LightGBM
+        m_lgb = lgb.LGBMRegressor(n_estimators=2000, learning_rate=0.02, objective='tweedie', random_state=seed, verbose=-1)
+        m_lgb.fit(xt, yt, eval_set=[(xv, yv)], callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
+        oof_preds['lgb'][v_idx] = m_lgb.predict(xv)
+        test_preds['lgb'] += m_lgb.predict(X_test) / n_splits
 
         # 2. XGBoost
-        m_xgb = xgb.XGBRegressor(**xgb_params, early_stopping_rounds=150)
+        m_xgb = xgb.XGBRegressor(n_estimators=2000, learning_rate=0.02, random_state=seed, early_stopping_rounds=100)
         m_xgb.fit(xt, yt, eval_set=[(xv, yv)], verbose=False)
-        oof_xgb[v_idx] = m_xgb.predict(xv)
-        test_xgb += m_xgb.predict(X_test) / n_splits
+        oof_preds['xgb'][v_idx] = m_xgb.predict(xv)
+        test_preds['xgb'] += m_xgb.predict(X_test) / n_splits
 
         # 3. CatBoost
-        m_cat = CatBoostRegressor(**cat_params, early_stopping_rounds=150)
+        m_cat = CatBoostRegressor(iterations=2000, learning_rate=0.02, random_seed=seed, verbose=0, early_stopping_rounds=100)
         m_cat.fit(xt, yt, eval_set=(xv, yv))
-        oof_cat[v_idx] = m_cat.predict(xv)
-        test_cat += m_cat.predict(X_test) / n_splits
+        oof_preds['cat'][v_idx] = m_cat.predict(xv)
+        test_preds['cat'] += m_cat.predict(X_test) / n_splits
 
-    # Stacking (Level 1)
-    logger.info("🧠 Training Stacking Meta-Model (Ridge)...")
-    X_meta = np.column_stack((oof_lgb, oof_xgb, oof_cat))
-    X_test_meta = np.column_stack((test_lgb, test_xgb, test_cat))
+        # 4. TabNet (Deep Learning)
+        m_tab = TabNetRegressor(verbose=0, seed=seed, optimizer_params=dict(lr=2e-2))
+        m_tab.fit(xt_s, yt.values.reshape(-1, 1), eval_set=[(xv_s, yv.values.reshape(-1, 1))], 
+                  patience=30, max_epochs=100, batch_size=1024, virtual_batch_size=128)
+        oof_preds['tabnet'][v_idx] = m_tab.predict(xv_s).flatten()
+        test_preds['tabnet'] += m_tab.predict(X_test_scaled).flatten() / n_splits
+
+    # Meta-Model Stacking
+    X_meta = np.column_stack([oof_preds[m] for m in models])
+    X_test_meta = np.column_stack([test_preds[m] for m in models])
     
     meta_model = Ridge(alpha=1.0)
     meta_model.fit(X_meta, y)
     
     final_preds = meta_model.predict(X_test_meta)
     
-    # Performance Report
-    rmse_lgb = np.sqrt(mean_squared_error(y, oof_lgb))
+    # Report
     rmse_stack = np.sqrt(mean_squared_error(y, meta_model.predict(X_meta)))
-    logger.info(f"📊 OOF LGBM RMSE: {rmse_lgb:.5f}")
-    logger.info(f"📊 OOF Stacked RMSE: {rmse_stack:.5f}")
+    logger.info(f"📊 Final Stacked RMSE: {rmse_stack:.5f}")
     
     return final_preds
