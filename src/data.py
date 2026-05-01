@@ -5,146 +5,100 @@ import datetime
 from sklearn.preprocessing import LabelEncoder
 import gc
 import logging
-from typing import Tuple, List
+from typing import Tuple
 
-# Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def create_transaction_features(txn_path: str) -> pl.DataFrame:
-    """Creates advanced transaction features using Polars."""
-    logger.info("Processing transaction features...")
+def create_advanced_features(data_dir: str) -> pl.DataFrame:
+    """Creates high-signal behavioral features using Polars."""
+    logger.info("🛠️ Extracting advanced behavioral features...")
     
-    # Use scan_parquet for memory efficiency
+    txn_path = f"{data_dir}/transactions_features/transactions_features.parquet"
     txn = pl.scan_parquet(txn_path)
-    
-    # Convert dates and basic cleaning
     txn = txn.with_columns(pl.col("TransactionDate").cast(pl.Date))
     
-    # Reference date (end of train period)
     ref_date = datetime.date(2015, 10, 31)
     
-    # Basic Aggregations
-    agg_features = txn.group_by("UniqueID").agg([
-        pl.len().alias("txn_count_total"),
-        pl.col("TransactionAmount").sum().alias("txn_amt_total"),
-        pl.col("TransactionAmount").mean().alias("txn_amt_avg"),
-        pl.col("TransactionAmount").std().alias("txn_amt_std"),
-        pl.col("TransactionAmount").max().alias("txn_amt_max"),
-        pl.col("TransactionDate").max().alias("last_txn_date"),
-        pl.col("TransactionDate").min().alias("first_txn_date"),
-        # Number of unique accounts
-        pl.col("AccountID").n_unique().alias("num_accounts")
+    # 1. RFM & Basic Aggs
+    rfm = txn.group_by("UniqueID").agg([
+        pl.len().alias("frequency"),
+        pl.col("TransactionAmount").sum().alias("monetary"),
+        pl.col("TransactionAmount").mean().alias("avg_spend"),
+        pl.col("TransactionAmount").std().alias("std_spend"),
+        ((pl.lit(ref_date) - pl.col("TransactionDate").max()).dt.total_days()).alias("recency"),
+        pl.col("AccountID").n_unique().alias("account_diversity"),
+        # Weekend behavior
+        pl.col("TransactionDate").dt.weekday().is_in([6, 7]).sum().alias("weekend_txn_count")
     ])
     
-    # Recency and Tenure
-    agg_features = agg_features.with_columns([
-        ((pl.lit(ref_date) - pl.col("last_txn_date")).dt.total_days()).alias("days_since_last_txn"),
-        ((pl.lit(ref_date) - pl.col("first_txn_date")).dt.total_days()).alias("customer_tenure"),
+    # 2. Diversity Score (Account concentration)
+    rfm = rfm.with_columns([
+        (pl.col("frequency") / pl.col("account_diversity")).alias("txn_per_account"),
+        (pl.col("weekend_txn_count") / pl.col("frequency")).alias("weekend_ratio")
     ])
     
-    # Velocity features (last 1 month vs last 3 months)
-    last_1m = txn.filter(pl.col("TransactionDate") >= datetime.date(2015, 10, 1)).group_by("UniqueID").agg([
-        pl.len().alias("txn_count_1m"),
-        pl.col("TransactionAmount").sum().alias("txn_amt_1m")
+    # 3. Monthly Trends (Last 3 months)
+    m1 = txn.filter(pl.col("TransactionDate") >= datetime.date(2015, 10, 1)).group_by("UniqueID").agg(pl.len().alias("m1_count"))
+    m2 = txn.filter((pl.col("TransactionDate") >= datetime.date(2015, 9, 1)) & (pl.col("TransactionDate") < datetime.date(2015, 10, 1))).group_by("UniqueID").agg(pl.len().alias("m2_count"))
+    m3 = txn.filter((pl.col("TransactionDate") >= datetime.date(2015, 8, 1)) & (pl.col("TransactionDate") < datetime.date(2015, 9, 1))).group_by("UniqueID").agg(pl.len().alias("m3_count"))
+    
+    trends = rfm.join(m1, on="UniqueID", how="left").join(m2, on="UniqueID", how="left").join(m3, on="UniqueID", how="left").fill_null(0)
+    
+    # 4. Momentum (Is activity increasing or decreasing?)
+    trends = trends.with_columns([
+        (pl.col("m1_count") / (pl.col("m2_count") + 1)).alias("momentum_1m"),
+        (pl.col("m1_count") / ((pl.col("m1_count") + pl.col("m2_count") + pl.col("m3_count")) / 3 + 1)).alias("velocity_3m")
     ])
     
-    last_3m = txn.filter(pl.col("TransactionDate") >= datetime.date(2015, 8, 1)).group_by("UniqueID").agg([
-        pl.len().alias("txn_count_3m"),
-        pl.col("TransactionAmount").sum().alias("txn_amt_3m")
-    ])
-    
-    # Combine all
-    txn_final = agg_features.join(last_1m, on="UniqueID", how="left").join(last_3m, on="UniqueID", how="left")
-    
-    # Fill nulls for those with no recent transactions
-    txn_final = txn_final.fill_null(0)
-    
-    # Derived features
-    txn_final = txn_final.with_columns([
-        (pl.col("txn_count_1m") / (pl.col("txn_count_3m") / 3).replace(0, 1)).alias("count_velocity"),
-        (pl.col("txn_amt_1m") / (pl.col("txn_amt_3m") / 3).replace(0, 1)).alias("amt_velocity"),
-    ])
-    
-    return txn_final.collect()
+    return trends.collect()
 
 def load_and_preprocess(data_dir: str, seed: int = 42) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
-    """Main data pipeline with best practices."""
+    """Robust pipeline with best practices for Zindi/Kaggle."""
     
-    # Define paths
-    train_path = f"{data_dir}/Train.csv"
-    test_path = f"{data_dir}/Test.csv"
-    demo_path = f"{data_dir}/demographics_clean/demographics_clean.parquet"
-    txn_path = f"{data_dir}/transactions_features/transactions_features.parquet"
-    fin_path = f"{data_dir}/financials_features/financials_features.parquet"
-
-    # 1. Load Transaction Features
-    txn_features = create_transaction_features(txn_path)
-    
-    # 2. Load Demographics
-    logger.info("Loading demographics...")
-    demo = pl.read_parquet(demo_path)
-    
-    # 3. Load Financials (simplified aggregation)
-    logger.info("Loading financials...")
-    fin = pl.read_parquet(fin_path).group_by("UniqueID").agg([
-        pl.col("NetInterestIncome").sum().alias("total_net_interest_income"),
-        pl.col("NetInterestRevenue").sum().alias("total_net_interest_revenue"),
+    train = pl.read_csv(f"{data_dir}/Train.csv")
+    test = pl.read_csv(f"{data_dir}/Test.csv")
+    demo = pl.read_parquet(f"{data_dir}/demographics_clean/demographics_clean.parquet")
+    fin = pl.read_parquet(f"{data_dir}/financials_features/financials_features.parquet").group_by("UniqueID").agg([
+        pl.col("NetInterestIncome").sum().alias("fin_income"),
+        pl.col("NetInterestRevenue").sum().alias("fin_revenue")
     ])
     
-    # 4. Load Train/Test
-    logger.info("Merging datasets...")
-    train = pl.read_csv(train_path)
-    test = pl.read_csv(test_path)
+    # Advanced features
+    behavior = create_advanced_features(data_dir)
     
-    def merge_all(df):
+    logger.info("Merging and cleaning...")
+    def pipeline(df):
         return (df.join(demo, on="UniqueID", how="left")
-                .join(txn_features, on="UniqueID", how="left")
+                .join(behavior, on="UniqueID", how="left")
                 .join(fin, on="UniqueID", how="left")
                 .fill_null(0))
 
-    train_full = merge_all(train)
-    test_full = merge_all(test)
+    train_pd = pipeline(train).to_pandas()
+    test_pd = pipeline(test).to_pandas()
     
-    # Convert to pandas for model compatibility
-    train_df = train_full.to_pandas()
-    test_df = test_full.to_pandas()
+    # Target transformation
+    y = np.log1p(train_pd["next_3m_txn_count"])
     
-    # Cleanup to save memory
-    del train, test, demo, txn_features, fin, train_full, test_full
-    gc.collect()
-
-    # 5. Feature Engineering (Pandas side)
-    # Age from BirthDate
-    if "BirthDate" in train_df.columns:
-        for df in [train_df, test_df]:
+    # Date handling
+    for df in [train_pd, test_pd]:
+        if "BirthDate" in df.columns:
             df["BirthDate"] = pd.to_datetime(df["BirthDate"], errors="coerce")
-            ref_date = pd.to_datetime("2015-10-31")
-            df["Age"] = (ref_date - df["BirthDate"]).dt.days // 365
+            df["Age"] = (pd.to_datetime("2015-10-31") - df["BirthDate"]).dt.days // 365
             df["Age"] = df["Age"].fillna(df["Age"].median())
-
-    # Label Encoding for categorical columns
-    cat_cols = train_df.select_dtypes(include=['object']).columns.tolist()
+            
+    # Categorical Encoding
+    cat_cols = train_pd.select_dtypes(include=['object']).columns.tolist()
     for col in ["UniqueID", "BirthDate", "RunDate"]:
         if col in cat_cols: cat_cols.remove(col)
         
-    logger.info(f"Encoding categorical features: {cat_cols}")
     for col in cat_cols:
         le = LabelEncoder()
-        # Handle unknown categories in test
-        combined = pd.concat([train_df[col].astype(str), test_df[col].astype(str)])
+        combined = pd.concat([train_pd[col].astype(str), test_pd[col].astype(str)])
         le.fit(combined)
-        train_df[col] = le.transform(train_df[col].astype(str))
-        test_df[col] = le.transform(test_df[col].astype(str))
+        train_pd[col] = le.transform(train_pd[col].astype(str))
+        test_pd[col] = le.transform(test_pd[col].astype(str))
 
-    # 6. Final Prep
-    drop_cols = ["UniqueID", "next_3m_txn_count", "BirthDate", "RunDate", "last_txn_date", "first_txn_date"]
-    features = [c for c in train_df.columns if c not in drop_cols]
+    features = [c for c in train_pd.columns if c not in ["UniqueID", "next_3m_txn_count", "BirthDate", "RunDate"]]
     
-    X = train_df[features]
-    y = np.log1p(train_df["next_3m_txn_count"])
-    X_test = test_df[features]
-    test_ids = test_df["UniqueID"]
-    
-    logger.info(f"Final feature set size: {len(features)}")
-    return X, y, X_test, test_ids
+    return train_pd[features], y, test_pd[features], test_pd["UniqueID"]
