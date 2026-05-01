@@ -1,0 +1,14 @@
+# Data
+data/
+*.csv
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Notebooks
+.ipynb_checkpoints/
