@@ -63,6 +63,18 @@ def create_advanced_features(data_dir: str) -> pl.DataFrame:
     behavior_df['spend_per_account'] = behavior_df['monetary'] / (behavior_df['account_diversity'] + 1)
     behavior_df['oct_ratio'] = behavior_df['oct_2015_count'] / (behavior_df['frequency'] + 1)
     
+    # 3. Handle Infinity and Large Values
+    # Replace Inf with NaN then fill with 0
+    behavior_df = behavior_df.replace([np.inf, -np.inf], np.nan).fillna(0)
+    
+    # Clip extreme values to prevent 'Value too large' errors
+    # Using 99.9th percentile clipping for spend and monetary features
+    cols_to_clip = ['monetary', 'avg_spend', 'std_spend', 'spend_per_account']
+    for col in cols_to_clip:
+        if col in behavior_df.columns:
+            upper_limit = behavior_df[col].quantile(0.999)
+            behavior_df[col] = behavior_df[col].clip(upper=upper_limit)
+    
     return pl.from_pandas(behavior_df)
 
 def load_and_preprocess(data_dir: str, seed: int = 42) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
