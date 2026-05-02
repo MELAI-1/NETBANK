@@ -49,11 +49,19 @@ def create_advanced_features(data_dir: str) -> pl.DataFrame:
         pl.len().alias("frequency"),
         pl.col("TransactionAmount").sum().alias("monetary"),
         pl.col("TransactionAmount").mean().alias("avg_spend"),
+        pl.col("TransactionAmount").std().alias("std_spend"),
         ((pl.lit(ref_date) - pl.col("TransactionDate").max()).dt.total_days()).alias("recency"),
-        pl.col("AccountID").n_unique().alias("account_diversity")
+        pl.col("AccountID").n_unique().alias("account_diversity"),
+        # Advanced: Velocity (Transactions in last 30 days vs total)
+        (pl.col("TransactionDate").filter(pl.col("TransactionDate") > pl.lit(ref_date - datetime.timedelta(days=30))).len() / (pl.len() + 1)).alias("velocity_30d")
     ]).collect()
     
-    return behavior
+    # 2. Cross-Features (Interactions)
+    behavior_df = behavior.to_pandas()
+    behavior_df['spend_per_account'] = behavior_df['monetary'] / (behavior_df['account_diversity'] + 1)
+    behavior_df['freq_per_recency'] = behavior_df['frequency'] / (behavior_df['recency'] + 1)
+    
+    return pl.from_pandas(behavior_df)
 
 def load_and_preprocess(data_dir: str, seed: int = 42) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
     """Pipeline ready for Colab/Kaggle."""
