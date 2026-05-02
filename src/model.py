@@ -9,6 +9,11 @@ from sklearn.metrics import mean_squared_error
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler, PowerTransformer
 from sklearn.ensemble import HistGradientBoostingRegressor
+import torch
+import logging
+
+# Ensure logger is defined in the module scope
+logger = logging.getLogger(__name__)
 
 def train_and_predict(X, y, X_test, seed=42):
     """
