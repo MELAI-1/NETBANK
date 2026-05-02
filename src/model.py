@@ -57,13 +57,16 @@ def train_and_predict(X, y, X_test, seed=42):
         # 3. LightGBM (Tweedie) - Supporting role
         m_lgb = lgb.LGBMRegressor(n_estimators=2000, learning_rate=0.02, objective='tweedie', 
                                   max_depth=8, num_leaves=31, random_state=seed, verbose=-1)
-        m_lgb.fit(xt, yt, eval_set=[(xv, yv)], callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
+        m_lgb.fit(xt, yt, eval_set=[(xv, yv)], 
+                  callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
         final_preds_dict['lgb'] += m_lgb.predict(X_test) / n_splits
 
         # 4. XGBoost - Supporting role
+        # Fix: Using early_stopping_rounds in constructor or fit depending on version
         m_xgb = xgb.XGBRegressor(n_estimators=1500, learning_rate=0.02, max_depth=7, 
-                                 subsample=0.8, colsample_bytree=0.8, random_state=seed)
-        m_xgb.fit(xt, yt, eval_set=[(xv, yv)], verbose=False, early_stopping_rounds=100)
+                                 subsample=0.8, colsample_bytree=0.8, random_state=seed,
+                                 early_stopping_rounds=100)
+        m_xgb.fit(xt, yt, eval_set=[(xv, yv)], verbose=False)
         final_preds_dict['xgb'] += m_xgb.predict(X_test) / n_splits
 
         # 5. TabNet - Diversity role
