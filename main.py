@@ -25,14 +25,17 @@ def main():
     # 1. Pipeline
     X, y, X_test, test_ids = load_and_preprocess(args.data_path, seed=args.seed)
     
-    # 2. Train Ensemble
+    # 2. Train Ensemble (Returns log-scale predictions)
     final_preds_log = train_and_predict(X, y, X_test, seed=args.seed)
     
     # 3. Save
-    final_preds_real = np.expm1(final_preds_log)
-    final_preds_real = np.maximum(final_preds_real, 0)
+    # The user requested the final submission to be in LOG SCALE.
+    # We use the log-transformed predictions directly.
+    final_preds_submit = final_preds_log
     
-    submission = pd.DataFrame({'UniqueID': test_ids, 'next_3m_txn_count': final_preds_real})
+    logger.info("📝 Saving final predictions in LOG SCALE as requested.")
+    
+    submission = pd.DataFrame({'UniqueID': test_ids, 'next_3m_txn_count': final_preds_submit})
     
     sample_sub_path = os.path.join(args.data_path, 'SampleSubmission .csv')
     if not os.path.exists(sample_sub_path):
