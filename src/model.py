@@ -7,12 +7,7 @@ from pytorch_tabnet.tab_model import TabNetRegressor
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import mean_squared_error
 from sklearn.linear_model import Ridge
-from sklearn.preprocessing import StandardScaler
-import torch
-import logging
-
-logger = logging.getLogger(__name__)
-
+from sklearn.preprocessing import StandardScaler, PowerTransformer
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 def train_and_predict(X, y, X_test, seed=42):
