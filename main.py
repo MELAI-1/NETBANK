@@ -25,30 +25,36 @@ def main():
     # 1. Pipeline
     X, y, X_test, test_ids = load_and_preprocess(args.data_path, seed=args.seed)
     
-    # 2. Train Ensemble (Returns log-scale predictions)
-    final_preds_log = train_and_predict(X, y, X_test, seed=args.seed)
+    # 2. Train Ensemble (Returns a dictionary of all models and blends)
+    preds_dict = train_and_predict(X, y, X_test, seed=args.seed)
     
-    # 3. Save
-    # The user requested the final submission to be in LOG SCALE.
-    # We use the log-transformed predictions directly.
-    final_preds_submit = final_preds_log
-    
-    logger.info("📝 Saving final predictions in LOG SCALE as requested.")
-    
-    submission = pd.DataFrame({'UniqueID': test_ids, 'next_3m_txn_count': final_preds_submit})
+    # 3. Save Multiple Submissions
+    logger.info(f"📂 Saving {len(preds_dict)} different submission versions...")
     
     sample_sub_path = os.path.join(args.data_path, 'SampleSubmission .csv')
     if not os.path.exists(sample_sub_path):
         sample_sub_path = os.path.join(args.data_path, 'SampleSubmission.csv')
+    
+    base_output = args.output_path.replace('.csv', '')
+    
+    for name, preds in preds_dict.items():
+        file_path = f"{base_output}_{name}.csv"
         
-    if os.path.exists(sample_sub_path):
-        sample_sub = pd.read_csv(sample_sub_path)
-        mapping = dict(zip(submission['UniqueID'], submission['next_3m_txn_count']))
-        sample_sub['next_3m_txn_count'] = sample_sub['UniqueID'].map(mapping).fillna(0)
-        sample_sub.to_csv(args.output_path, index=False)
-        logger.info(f"✅ Quad Ensemble Submission saved: {args.output_path}")
-    else:
-        submission.to_csv(args.output_path, index=False)
+        # Prepare submission
+        submission = pd.DataFrame({'UniqueID': test_ids, 'next_3m_txn_count': preds})
+        
+        if os.path.exists(sample_sub_path):
+            sample_sub = pd.read_csv(sample_sub_path)
+            mapping = dict(zip(submission['UniqueID'], submission['next_3m_txn_count']))
+            sample_sub['next_3m_txn_count'] = sample_sub['UniqueID'].map(mapping).fillna(0)
+            sample_sub.to_csv(file_path, index=False)
+        else:
+            submission.to_csv(file_path, index=False)
+            
+        logger.info(f"💾 Saved: {file_path}")
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()

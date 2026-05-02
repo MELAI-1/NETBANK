@@ -13,75 +13,72 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from sklearn.preprocessing import RobustScaler, PowerTransformer
+from sklearn.ensemble import HistGradientBoostingRegressor
 
 def train_and_predict(X, y, X_test, seed=42):
     """
-    SOTA Frontier Pipeline:
-    1. Seed Averaging (Stability)
-    2. Rank-Based Blending (Robustness to Outliers)
-    3. PowerTransform (Normalization)
+    Model Factory: Returns a dictionary of ALL model predictions
+    Allows user to test individual performance and various blends.
     """
     n_splits = 5
-    seeds = [seed, seed + 1, seed + 2] # Average across 3 seeds for max stability
+    y_bins = pd.cut(y, bins=10, labels=False)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     
-    all_test_preds = []
+    # Pre-scaling
+    pt = PowerTransformer()
+    X_pt = pt.fit_transform(X)
+    X_test_pt = pt.transform(X_test)
     
-    for current_seed in seeds:
-        logger.info(f"✨ Running Seed {current_seed}...")
-        y_bins = pd.cut(y, bins=10, labels=False)
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=current_seed)
+    # Individual Model Storage
+    models_list = ['lgb', 'xgb', 'cat', 'tabnet', 'hgbr']
+    final_preds_dict = {m: np.zeros(len(X_test)) for m in models_list}
+
+    for fold, (t_idx, v_idx) in enumerate(skf.split(X, y_bins)):
+        logger.info(f"🚀 Training Fold {fold+1}/{n_splits}...")
         
-        # Scaling
-        pt = PowerTransformer()
-        X_pt = pt.fit_transform(X)
-        X_test_pt = pt.transform(X_test)
-        
-        models = ['lgb', 'xgb', 'cat', 'tabnet']
-        test_preds = {m: np.zeros(len(X_test)) for m in models}
+        xt, yt = X.iloc[t_idx], y.iloc[t_idx]
+        xv, yv = X.iloc[v_idx], y.iloc[v_idx]
+        xt_s, xv_s = X_pt[t_idx], X_pt[v_idx]
 
-        for fold, (t_idx, v_idx) in enumerate(skf.split(X, y_bins)):
-            xt, yt = X.iloc[t_idx], y.iloc[t_idx]
-            xv, yv = X.iloc[v_idx], y.iloc[v_idx]
-            xt_s, xv_s = X_pt[t_idx], X_pt[v_idx]
+        # 1. LightGBM (Tweedie)
+        m_lgb = lgb.LGBMRegressor(n_estimators=2000, learning_rate=0.02, objective='tweedie', random_state=seed, verbose=-1)
+        m_lgb.fit(xt, yt, eval_set=[(xv, yv)], callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
+        final_preds_dict['lgb'] += m_lgb.predict(X_test) / n_splits
 
-            # LGBM (Tweedie is SOTA for count data)
-            m_lgb = lgb.LGBMRegressor(n_estimators=2000, learning_rate=0.015, objective='tweedie', 
-                                    max_depth=9, num_leaves=63, random_state=current_seed, verbose=-1)
-            m_lgb.fit(xt, yt, eval_set=[(xv, yv)], callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
-            test_preds['lgb'] += m_lgb.predict(X_test) / n_splits
+        # 2. XGBoost
+        m_xgb = xgb.XGBRegressor(n_estimators=2000, learning_rate=0.02, random_state=seed, early_stopping_rounds=100)
+        m_xgb.fit(xt, yt, eval_set=[(xv, yv)], verbose=False)
+        final_preds_dict['xgb'] += m_xgb.predict(X_test) / n_splits
 
-            # XGB (Dart can be more robust)
-            m_xgb = xgb.XGBRegressor(n_estimators=2000, learning_rate=0.015, max_depth=7, 
-                                   tree_method='hist', random_state=current_seed, early_stopping_rounds=100)
-            m_xgb.fit(xt, yt, eval_set=[(xv, yv)], verbose=False)
-            test_preds['xgb'] += m_xgb.predict(X_test) / n_splits
+        # 3. CatBoost
+        m_cat = CatBoostRegressor(iterations=2000, learning_rate=0.02, random_seed=seed, verbose=0, early_stopping_rounds=100)
+        m_cat.fit(xt, yt, eval_set=(xv, yv))
+        final_preds_dict['cat'] += m_cat.predict(X_test) / n_splits
 
-            # Cat (Symmetry trees are excellent for generalization)
-            m_cat = CatBoostRegressor(iterations=2000, learning_rate=0.015, depth=7, 
-                                    random_seed=current_seed, verbose=0, early_stopping_rounds=100)
-            m_cat.fit(xt, yt, eval_set=(xv, yv))
-            test_preds['cat'] += m_cat.predict(X_test) / n_splits
+        # 4. TabNet
+        m_tab = TabNetRegressor(verbose=0, seed=seed)
+        m_tab.fit(xt_s, yt.values.reshape(-1, 1), eval_set=[(xv_s, yv.values.reshape(-1, 1))], 
+                  patience=30, max_epochs=100, batch_size=4096, virtual_batch_size=256)
+        final_preds_dict['tabnet'] += m_tab.predict(X_test_pt).flatten() / n_splits
 
-            # TabNet
-            m_tab = TabNetRegressor(verbose=0, seed=current_seed)
-            m_tab.fit(xt_s, yt.values.reshape(-1, 1), eval_set=[(xv_s, yv.values.reshape(-1, 1))], 
-                      patience=30, max_epochs=100, batch_size=4096, virtual_batch_size=256)
-            test_preds['tabnet'] += m_tab.predict(X_test_pt).flatten() / n_splits
+        # 5. HistGradientBoosting (Scikit-Learn's version of LGBM, sometimes generalizes better)
+        m_hgbr = HistGradientBoostingRegressor(max_iter=1000, learning_rate=0.02, random_state=seed, early_stopping=True)
+        m_hgbr.fit(xt, yt)
+        final_preds_dict['hgbr'] += m_hgbr.predict(X_test) / n_splits
 
-        # Rank Blending for the current seed
-        # This converts predictions to ranks to avoid one model pulling the average too far
-        seed_preds = (
-            pd.Series(test_preds['lgb']).rank(pct=True) * 0.4 +
-            pd.Series(test_preds['cat']).rank(pct=True) * 0.3 +
-            pd.Series(test_preds['xgb']).rank(pct=True) * 0.2 +
-            pd.Series(test_preds['tabnet']).rank(pct=True) * 0.1
-        )
-        
-        # Map rank back to Log-Distribution of Y_train
-        # This is the "secret sauce" of top Zindi competitors
-        final_seed_preds = np.percentile(y, seed_preds * 100)
-        all_test_preds.append(final_seed_preds)
+    # Create Blends
+    # Blend A: Simple Weighted Average (GBDTs focus)
+    final_preds_dict['blend_weighted'] = (
+        final_preds_dict['lgb'] * 0.35 +
+        final_preds_dict['cat'] * 0.35 +
+        final_preds_dict['xgb'] * 0.15 +
+        final_preds_dict['hgbr'] * 0.15
+    )
 
-    # Average the results of all seeds
-    return np.mean(all_test_preds, axis=0)
+    # Blend B: Rank-Based (Most robust for RMSLE)
+    ranks = pd.DataFrame({m: pd.Series(final_preds_dict[m]).rank(pct=True) for m in models_list})
+    avg_rank = ranks.mean(axis=1)
+    # Map back to training distribution
+    final_preds_dict['blend_rank'] = np.percentile(y, avg_rank * 100)
+
+    return final_preds_dict
