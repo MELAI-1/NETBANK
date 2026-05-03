@@ -5,8 +5,7 @@ import datetime
 import os
 import logging
 import zipfile
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.cluster import KMeans
+from sklearn.preprocessing import LabelEncoder
 from typing import Tuple
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,9 +18,7 @@ def unzip_data(data_dir: str):
     for item in os.listdir(data_dir):
         if item.endswith(".zip"):
             file_path = os.path.join(data_dir, item)
-            folder_name = item.replace(".zip", "")
-            output_dir = os.path.join(data_dir, folder_name)
-            if not os.path.exists(output_dir):
+            if not os.path.exists(os.path.join(data_dir, item.replace(".zip", ""))):
                 with zipfile.ZipFile(file_path, 'r') as zip_ref:
                     zip_ref.extractall(data_dir)
 
@@ -39,63 +36,65 @@ def find_file(data_dir: str, pattern: str) -> str:
 
 def build_advanced_features(data_dir: str) -> pd.DataFrame:
     """
-    Kaggle Grandmaster 'Golden Features':
-    1. NIR per Transaction (Financial Efficiency)
-    2. Balance Stability Index (Coefficient of Variation)
-    3. Income Utilization Ratio (Total Debit / Total Credit)
+    Robust Temporal & Behavioral Features:
+    - Activity Velocity (Recent vs. Historical)
+    - Dormancy Status
+    - NIR/Income Stability
     """
-    logger.info("🚀 Building Breakthrough Golden Features...")
+    logger.info("🚀 Building Temporal Tweedie Features...")
     unzip_data(data_dir)
     
     txn_path = find_file(data_dir, "transactions_features.parquet")
     demo_path = find_file(data_dir, "demographics_clean.parquet")
     fin_path = find_file(data_dir, "financials_features.parquet")
 
-    # 1. Transactions - Deep Dive
+    # 1. Transactions - Temporal Analysis
     txn = pl.scan_parquet(txn_path).with_columns(
-        pl.col("TransactionDate").cast(pl.Datetime)
+        pl.col("TransactionDate").cast(pl.Date)
     )
+    
+    # Define time windows
+    recent_start = datetime.date(2015, 10, 1)
+    mid_start = datetime.date(2015, 8, 1)
     
     txn_agg = txn.group_by("UniqueID").agg([
         pl.len().alias("freq_total"),
         pl.col("TransactionAmount").sum().alias("monetary_total"),
         pl.col("TransactionAmount").mean().alias("avg_spend"),
-        pl.col("TransactionAmount").std().alias("std_spend"),
-        # Golden Feature: Balance Volatility (Stability)
-        (pl.col("StatementBalance").std() / (pl.col("StatementBalance").mean().abs() + 1)).alias("balance_volatility"),
-        ((pl.lit(CUTOFF_DATE) - pl.col("TransactionDate").max()).dt.total_days()).alias("recency_days"),
+        # Temporal Slices
+        (pl.col("TransactionDate").filter(pl.col("TransactionDate") >= recent_start).len()).alias("freq_last_month"),
+        (pl.col("TransactionDate").filter((pl.col("TransactionDate") >= mid_start) & (pl.col("TransactionDate") < recent_start)).len()).alias("freq_mid_term"),
+        # Recency & Diversity
+        ((pl.lit(CUTOFF_DATE.date()) - pl.col("TransactionDate").max()).dt.total_days()).alias("recency_days"),
+        pl.col("AccountID").n_unique().alias("n_accounts"),
+        # Credit/Debit Ratio
         (pl.col("TransactionAmount").filter(pl.col("TransactionAmount") > 0).sum()).alias("total_credit"),
         (pl.col("TransactionAmount").filter(pl.col("TransactionAmount") < 0).abs().sum()).alias("total_debit")
     ]).collect().to_pandas()
 
-    # 2. Financials - Profitability Features
-    fin = pl.scan_parquet(fin_path)
-    fin_agg = fin.group_by("UniqueID").agg([
+    # Feature Engineering: Temporal Velocity
+    txn_agg['activity_velocity'] = txn_agg['freq_last_month'] / (txn_agg['freq_mid_term'] / 2 + 1)
+    txn_agg['is_dormant_recent'] = (txn_agg['freq_last_month'] == 0).astype(int)
+    txn_agg['credit_debit_ratio'] = txn_agg['total_credit'] / (txn_agg['total_debit'] + 1)
+
+    # 2. Financials
+    fin_agg = pl.scan_parquet(fin_path).group_by("UniqueID").agg([
         pl.col("NetInterestRevenue").sum().alias("total_nir"),
         pl.col("NetInterestIncome").mean().alias("avg_nii")
     ]).collect().to_pandas()
 
-    # 3. Merging & Golden Ratios
+    # 3. Merge & Demographics
     demo = pl.scan_parquet(demo_path).collect().to_pandas()
     df = demo.merge(txn_agg, on="UniqueID", how="left").merge(fin_agg, on="UniqueID", how="left")
     
-    # Golden Feature 1: Income Utilization Ratio
-    df['income_utilization'] = df['total_debit'] / (df['total_credit'] + 1)
-    
-    # Golden Feature 2: NIR Efficiency (Revenue per Activity)
-    df['nir_per_txn'] = df['total_nir'] / (df['freq_total'] + 1)
-    
-    # Golden Feature 3: Spending Volatility Index
-    df['spending_volatility'] = df['std_spend'] / (df['avg_spend'].abs() + 1)
-
-    # Clean Up
+    # Final Clean Up
     num_cols = df.select_dtypes(include=[np.number]).columns
     df[num_cols] = df[num_cols].fillna(0)
     
-    # Log-transform skewed features for stability
-    skewed_cols = ['monetary_total', 'total_credit', 'total_debit', 'total_nir']
-    for col in skewed_cols:
-        df[col] = np.log1p(df[col].clip(0))
+    # Clip extreme monetary values
+    for col in ['monetary_total', 'total_credit', 'total_debit', 'total_nir']:
+        upper = df[col].quantile(0.99)
+        df[col] = df[col].clip(upper=upper)
 
     return df
 
@@ -111,9 +110,9 @@ def load_and_preprocess(data_dir: str, seed: int = SEED) -> Tuple:
     train_df = train_base.merge(all_features, on="UniqueID", how="left")
     test_df = test_base.merge(all_features, on="UniqueID", how="left")
     
+    # Target transformation (RMSLE focus)
     y = np.log1p(train_df["next_3m_txn_count"])
     
-    # Keep it simple: Label Encoding for Categoricals
     cat_cols = all_features.select_dtypes(include=['object']).columns.tolist()
     if 'UniqueID' in cat_cols: cat_cols.remove('UniqueID')
     

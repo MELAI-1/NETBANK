@@ -4,79 +4,99 @@ import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostRegressor
 from sklearn.model_selection import KFold
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import RidgeCV
+from sklearn.metrics import mean_squared_error
 import logging
 
 logger = logging.getLogger(__name__)
 SEED = 42
 
-def asymmetric_mse_loss(y_true, y_pred):
-    """
-    Asymmetric Loss: Penalize under-predictions more heavily.
-    Optimized for RMSLE in log-space.
-    """
-    residual = y_pred - y_true
-    # k=1.5 penalty for under-prediction (residual < 0)
-    grad = np.where(residual < 0, 2.0 * residual * 2.0, 2.0 * residual)
-    hess = np.where(residual < 0, 2.0 * 2.0, 2.0)
-    return grad, hess
-
 def train_and_predict(X, y, X_test, seed=SEED):
     """
-    Expert Mixture Architecture (MoE):
-    1. Gater: Identifies High-Variance/Hard customers.
-    2. Expert A: Optimized for Bulk (Central Distribution).
-    3. Expert B: Specialized in High-Variance (Asymmetric Loss).
+    Robust Temporal Tweedie Stacking (Level 1):
+    - Models: LGBM, XGB, CatBoost (all with Tweedie objective)
+    - Meta-Learner: RidgeCV (Regularized Linear Stacking)
     """
     n_splits = 5
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
     
-    oof_base = np.zeros(len(X))
-    gater_probs = np.zeros(len(X_test))
+    # Model Storage
+    models = ['lgb', 'xgb', 'cat']
+    oof_preds = {m: np.zeros(len(X)) for m in models}
+    test_preds = {m: np.zeros(len(X_test)) for m in models}
     
-    # --- PHASE 1: Detection (Identify the Problem Cluster) ---
-    logger.info("🔍 Phase 1: Detecting High-Error Cluster via OOF Residuals...")
-    for t_idx, v_idx in kf.split(X, y):
-        m_base = CatBoostRegressor(iterations=1000, learning_rate=0.05, depth=6, random_seed=seed, verbose=0)
-        m_base.fit(X.iloc[t_idx], y.iloc[t_idx])
-        oof_base[v_idx] = m_base.predict(X.iloc[v_idx])
+    # Tweedie Power 1.2 is generally robust for zero-inflated bank transaction counts
+    TWEEDIE_POWER = 1.2
     
-    # Calculate Residuals and label 'Hard' cases (Top 15% error)
-    residuals = np.abs(y - oof_base)
-    threshold = np.percentile(residuals, 85)
-    is_hard = (residuals > threshold).astype(int)
+    for fold, (t_idx, v_idx) in enumerate(kf.split(X, y)):
+        logger.info(f"🏆 Training Fold {fold+1}/{n_splits}...")
+        
+        xt, yt = X.iloc[t_idx], y.iloc[t_idx]
+        xv, yv = X.iloc[v_idx], y.iloc[v_idx]
+        
+        # Raw space for Tweedie models
+        yt_raw, yv_raw = np.expm1(yt), np.expm1(yv)
+
+        # 1. LightGBM (Tweedie)
+        m_lgb = lgb.LGBMRegressor(
+            objective='tweedie',
+            tweedie_variance_power=TWEEDIE_POWER,
+            n_estimators=2000,
+            learning_rate=0.015,
+            num_leaves=32,
+            feature_fraction=0.8,
+            random_state=seed,
+            verbose=-1
+        )
+        m_lgb.fit(xt, yt_raw, eval_set=[(xv, yv_raw)], callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
+        oof_preds['lgb'][v_idx] = np.log1p(np.maximum(0, m_lgb.predict(xv)))
+        test_preds['lgb'] += np.log1p(np.maximum(0, m_lgb.predict(X_test))) / n_splits
+
+        # 2. XGBoost (Tweedie)
+        m_xgb = xgb.XGBRegressor(
+            objective='reg:tweedie',
+            tweedie_variance_power=TWEEDIE_POWER,
+            n_estimators=1500,
+            learning_rate=0.015,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=seed
+        )
+        m_xgb.fit(xt, yt_raw, eval_set=[(xv, yv_raw)], early_stopping_rounds=100, verbose=False)
+        oof_preds['xgb'][v_idx] = np.log1p(np.maximum(0, m_xgb.predict(xv)))
+        test_preds['xgb'] += np.log1p(np.maximum(0, m_xgb.predict(X_test))) / n_splits
+
+        # 3. CatBoost (Tweedie)
+        m_cat = CatBoostRegressor(
+            loss_function=f'Tweedie:variance_power={TWEEDIE_POWER}',
+            iterations=1500,
+            learning_rate=0.015,
+            depth=6,
+            random_seed=seed,
+            verbose=0,
+            early_stopping_rounds=100
+        )
+        m_cat.fit(xt, yt_raw, eval_set=(xv, yv_raw))
+        oof_preds['cat'][v_idx] = np.log1p(np.maximum(0, m_cat.predict(xv)))
+        test_preds['cat'] += np.log1p(np.maximum(0, m_cat.predict(X_test))) / n_splits
+
+    # --- LEVEL 1: RidgeCV Stacking ---
+    logger.info("🧠 Level 1: RidgeCV Stacking...")
+    X_meta = np.column_stack([oof_preds[m] for m in models])
+    X_meta_test = np.column_stack([test_preds[m] for m in models])
     
-    # --- PHASE 2: Gater Model (Binary Classifier) ---
-    logger.info("🤖 Phase 2: Training Gater (Meta-Learner)...")
-    gater = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=seed)
-    gater.fit(X, is_hard)
-    gater_probs = gater.predict_proba(X_test)[:, 1]
+    # Meta-learner is trained in log-space (RMSLE focus)
+    meta_model = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0], cv=5)
+    meta_model.fit(X_meta, y)
     
-    # --- PHASE 3: Specialized Experts ---
-    logger.info("⚔️ Phase 3: Training Specialized Experts...")
+    final_stack = meta_model.predict(X_meta_test)
     
-    # Expert A: Bulk (Balanced)
-    m_bulk = lgb.LGBMRegressor(n_estimators=2000, learning_rate=0.02, num_leaves=31, random_state=seed, verbose=-1)
-    m_bulk.fit(X, y)
-    pred_bulk = m_bulk.predict(X_test)
+    logger.info(f"✅ Stacking Complete. Ridge Alpha: {meta_model.alpha_}")
     
-    # Expert B: High-Variance (Asymmetric Loss)
-    # Using XGBoost with Custom Objective for Expert B
-    m_hv = xgb.XGBRegressor(n_estimators=2000, learning_rate=0.02, max_depth=8, random_state=seed)
-    m_hv.set_params(objective=asymmetric_mse_loss)
-    m_hv.fit(X, y)
-    pred_hv = m_hv.predict(X_test)
-    
-    # --- PHASE 4: Expert Mixture (Soft Gating) ---
-    # Combine based on Gater's probability of being a 'Hard' customer
-    final_preds = (1 - gater_probs) * pred_bulk + gater_probs * pred_hv
-    
-    results = {
-        'moe_final': final_preds,
-        'expert_bulk': pred_bulk,
-        'expert_hv': pred_hv,
-        'gater_confidence': gater_probs
+    return {
+        'final_stack': final_stack,
+        'lgb': test_preds['lgb'],
+        'xgb': test_preds['xgb'],
+        'cat': test_preds['cat']
     }
-    
-    logger.info("✅ Mixture of Experts training complete.")
-    return results
