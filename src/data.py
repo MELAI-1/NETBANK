@@ -32,25 +32,22 @@ def unzip_data(data_dir: str):
                 logger.info(f"📦 Unzipping {item}...")
                 try:
                     with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                        zip_ref.extractall(data_dir) # Extract to data_dir directly
+                        zip_ref.extractall(data_dir) 
                 except Exception as e:
                     logger.error(f"❌ Error unzipping {item}: {e}")
 
 def find_file(data_dir: str, pattern: str) -> str:
     """Robustly find a file even with spaces or different extensions."""
-    # First check direct matches
     full_path = os.path.join(data_dir, pattern)
     if os.path.exists(full_path):
         return full_path
     
-    # Check for versions with spaces (e.g., "Train .csv")
     name, ext = os.path.splitext(pattern)
     alt_pattern = f"{name} {ext}"
     alt_path = os.path.join(data_dir, alt_pattern)
     if os.path.exists(alt_path):
         return alt_path
     
-    # Recursive search as fallback
     for root, dirs, files in os.walk(data_dir):
         for f in files:
             if pattern.lower() in f.lower().replace(" ", ""):
@@ -65,18 +62,19 @@ def build_advanced_features(data_dir: str) -> pd.DataFrame:
     logger.info("🚀 Starting Advanced Feature Engineering...")
     unzip_data(data_dir)
     
-    # Robust Parquet Loading
+    # Robust Path Discovery
     txn_path = find_file(data_dir, "transactions_features.parquet")
     demo_path = find_file(data_dir, "demographics_clean.parquet")
     fin_path = find_file(data_dir, "financials_features.parquet")
 
     logger.info(f"  📂 Loading: {os.path.basename(txn_path)}, {os.path.basename(demo_path)}, {os.path.basename(fin_path)}")
 
-    txn = pl.read_parquet(txn_path).with_columns(
+    # Use scan_parquet (Lazy) for memory efficiency and proper .collect() usage
+    txn = pl.scan_parquet(txn_path).with_columns(
         pl.col("TransactionDate").cast(pl.Datetime)
     )
-    demo = pl.read_parquet(demo_path)
-    fin = pl.read_parquet(fin_path).with_columns(
+    demo = pl.scan_parquet(demo_path)
+    fin = pl.scan_parquet(fin_path).with_columns(
         pl.col("RunDate").cast(pl.Datetime)
     )
 
@@ -94,7 +92,7 @@ def build_advanced_features(data_dir: str) -> pd.DataFrame:
         (pl.col("TransactionDate").filter(pl.col("TransactionDate") >= recent_date).len()).alias("freq_30d"),
         (pl.col("TransactionAmount").filter(pl.col("TransactionAmount") > 0).sum()).alias("total_credit"),
         (pl.col("TransactionAmount").filter(pl.col("TransactionAmount") < 0).abs().sum()).alias("total_debit")
-    ]).collect().to_pandas()
+    ]).collect().to_pandas() # .collect() is valid here because txn is a LazyFrame
 
     txn_agg['velocity_index'] = txn_agg['freq_30d'] / (txn_agg['freq_total'] / 6 + 1)
     txn_agg['stability_index'] = txn_agg['std_spend'] / (txn_agg['avg_spend'].abs() + 1)
@@ -106,11 +104,12 @@ def build_advanced_features(data_dir: str) -> pd.DataFrame:
         pl.col("NetInterestIncome").mean().alias("avg_nii"),
         pl.col("NetInterestRevenue").sum().alias("total_nir"),
         pl.col("Product").n_unique().alias("product_diversity")
-    ]).collect().to_pandas()
+    ]).collect().to_pandas() # .collect() is valid here because fin is a LazyFrame
 
     # 4. Merge All Sources
     logger.info("  [FE] Merging Sources...")
-    demo_pd = demo.to_pandas()
+    # demo is also a LazyFrame, so collect it before converting to pandas
+    demo_pd = demo.collect().to_pandas()
     df = demo_pd.merge(txn_agg, on="UniqueID", how="left")
     df = df.merge(fin_agg, on="UniqueID", how="left")
     
@@ -137,7 +136,6 @@ def load_and_preprocess(data_dir: str, seed: int = SEED) -> Tuple[pd.DataFrame, 
     """Main Pipeline Implementation with robust path finding."""
     unzip_data(data_dir)
     
-    # Find CSVs (Handling "Train .csv" vs "Train.csv")
     train_path = find_file(data_dir, "Train.csv")
     test_path = find_file(data_dir, "Test.csv")
     
